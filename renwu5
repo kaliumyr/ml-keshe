@@ -1,0 +1,683 @@
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as transforms
+from PIL import Image
+import cv2
+from sklearn.model_selection import train_test_split
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+import pandas as pd
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+
+# ============ 配置参数 ============
+class Config:
+    # 路径配置
+    train_image_dir = '/kaggle/input/renwu5/segmentation/train/image'
+    train_mask_dir = '/kaggle/input/renwu5/segmentation/train/label'
+    test_image_dir = '/kaggle/input/renwu5/segmentation/test/image'
+    prediction_dir = '/kaggle/working/image'
+    
+    # 模型参数
+    image_size = 512
+    batch_size = 4
+    num_epochs = 50
+    learning_rate = 1e-4
+    num_workers = 2
+    
+    # 设备
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # 随机种子
+    seed = 42
+
+# ============ 设置随机种子 ============
+def set_seed(seed=42):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+
+set_seed(Config.seed)
+
+# ============ UNet模型 ============
+class UNet(nn.Module):
+    def __init__(self, in_channels=3, out_channels=1, features=[64, 128, 256, 512]):
+        super(UNet, self).__init__()
+        self.encoder = nn.ModuleList()
+        self.decoder = nn.ModuleList()
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        
+        # Encoder
+        for feature in features:
+            self.encoder.append(
+                nn.Sequential(
+                    nn.Conv2d(in_channels, feature, kernel_size=3, padding=1),
+                    nn.BatchNorm2d(feature),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(feature, feature, kernel_size=3, padding=1),
+                    nn.BatchNorm2d(feature),
+                    nn.ReLU(inplace=True)
+                )
+            )
+            in_channels = feature
+        
+        # Bottleneck
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(features[-1], features[-1]*2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(features[-1]*2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(features[-1]*2, features[-1]*2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(features[-1]*2),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Decoder
+        features = features[::-1]
+        for i, feature in enumerate(features):
+            self.decoder.append(
+                nn.ConvTranspose2d(feature*2, feature, kernel_size=2, stride=2)
+            )
+            self.decoder.append(
+                nn.Sequential(
+                    nn.Conv2d(feature*2, feature, kernel_size=3, padding=1),
+                    nn.BatchNorm2d(feature),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(feature, feature, kernel_size=3, padding=1),
+                    nn.BatchNorm2d(feature),
+                    nn.ReLU(inplace=True)
+                )
+            )
+        
+        # Final layer
+        self.final_conv = nn.Conv2d(features[-1], out_channels, kernel_size=1)
+    
+    def forward(self, x):
+        skip_connections = []
+        
+        # Encoder
+        for encode in self.encoder:
+            x = encode(x)
+            skip_connections.append(x)
+            x = self.pool(x)
+        
+        # Bottleneck
+        x = self.bottleneck(x)
+        
+        # Decoder
+        skip_connections = skip_connections[::-1]
+        for idx in range(0, len(self.decoder), 2):
+            x = self.decoder[idx](x)
+            skip_connection = skip_connections[idx//2]
+            
+            if x.shape != skip_connection.shape:
+                x = transforms.functional.resize(x, size=skip_connection.shape[2:])
+            
+            concat_skip = torch.cat((skip_connection, x), dim=1)
+            x = self.decoder[idx+1](concat_skip)
+        
+        return torch.sigmoid(self.final_conv(x))
+
+# ============ 数据集类 ============
+class FundusDataset(Dataset):
+    def __init__(self, image_dir, mask_dir=None, transform=None, train=True):
+        self.image_dir = image_dir
+        self.mask_dir = mask_dir
+        self.transform = transform
+        self.train = train
+        
+        # 获取图像列表
+        self.images = sorted([f for f in os.listdir(image_dir) 
+                            if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tif'))])
+        
+        if train and mask_dir:
+            self.masks = sorted([f for f in os.listdir(mask_dir) 
+                               if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tif'))])
+    
+    def __len__(self):
+        return len(self.images)
+    
+    def __getitem__(self, idx):
+        img_path = os.path.join(self.image_dir, self.images[idx])
+        
+        # 读取图像
+        image = cv2.imread(img_path)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        if self.train and self.mask_dir:
+            mask_path = os.path.join(self.mask_dir, self.masks[idx])
+            
+            # 读取掩码
+            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+            
+            # 根据任务说明：标签中血管为0，背景为255
+            # 训练时需要将血管设为1，背景设为0
+            mask = (mask < 128).astype(np.float32)  # 血管为1，背景为0
+            
+            if self.transform:
+                augmented = self.transform(image=image, mask=mask)
+                image = augmented['image']
+                mask = augmented['mask']
+            
+            mask = mask.unsqueeze(0)  # 添加通道维度
+            
+            return image, mask
+        else:
+            if self.transform:
+                augmented = self.transform(image=image)
+                image = augmented['image']
+            
+            return image, self.images[idx]
+
+# ============ 数据增强 ============
+def get_train_transform():
+    return A.Compose([
+        A.Resize(Config.image_size, Config.image_size),
+        A.Rotate(limit=15, p=0.5),
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.5),
+        A.RandomBrightnessContrast(p=0.2),
+        A.GaussNoise(p=0.2),
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ToTensorV2(),
+    ])
+
+def get_val_transform():
+    return A.Compose([
+        A.Resize(Config.image_size, Config.image_size),
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ToTensorV2(),
+    ])
+
+# ============ 损失函数 ============
+class DiceBCELoss(nn.Module):
+    def __init__(self, weight=0.7):
+        super(DiceBCELoss, self).__init__()
+        self.weight = weight
+        self.bce = nn.BCELoss()
+    
+    def forward(self, predictions, targets):
+        # Dice损失
+        predictions = predictions.view(-1)
+        targets = targets.view(-1)
+        
+        intersection = (predictions * targets).sum()
+        dice_loss = 1 - (2. * intersection + 1e-6) / (predictions.sum() + targets.sum() + 1e-6)
+        
+        # BCE损失
+        bce_loss = self.bce(predictions, targets)
+        
+        # 组合损失
+        return self.weight * dice_loss + (1 - self.weight) * bce_loss
+
+# ============ Dice分数计算 ============
+def compute_dice_score(predictions, targets):
+    predictions = predictions.cpu().numpy().flatten()
+    targets = targets.cpu().numpy().flatten()
+    
+    intersection = np.sum(predictions * targets)
+    dice = (2. * intersection + 1e-6) / (np.sum(predictions) + np.sum(targets) + 1e-6)
+    
+    return dice
+
+# ============ 训练函数 ============
+def train():
+    print(f"Using device: {Config.device}")
+    print(f"Training images: {Config.train_image_dir}")
+    print(f"Training masks: {Config.train_mask_dir}")
+    
+    # 检查数据目录
+    if not os.path.exists(Config.train_image_dir):
+        print(f"Error: Training image directory '{Config.train_image_dir}' does not exist!")
+        return
+    
+    if not os.path.exists(Config.train_mask_dir):
+        print(f"Error: Training mask directory '{Config.train_mask_dir}' does not exist!")
+        return
+    
+    # 创建数据集
+    train_transform = get_train_transform()
+    val_transform = get_val_transform()
+    
+    # 获取所有图像文件
+    image_files = sorted([f for f in os.listdir(Config.train_image_dir) 
+                         if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tif'))])
+    
+    # 划分训练集和验证集
+    train_idx, val_idx = train_test_split(range(len(image_files)), test_size=0.2, random_state=Config.seed)
+    
+    # 创建完整数据集
+    full_dataset = FundusDataset(
+        image_dir=Config.train_image_dir,
+        mask_dir=Config.train_mask_dir,
+        transform=train_transform,
+        train=True
+    )
+    
+    # 创建训练集和验证集的子集
+    train_dataset = torch.utils.data.Subset(full_dataset, train_idx)
+    
+    # 验证集使用不同的transform（不进行数据增强）
+    val_dataset_full = FundusDataset(
+        image_dir=Config.train_image_dir,
+        mask_dir=Config.train_mask_dir,
+        transform=val_transform,
+        train=True
+    )
+    val_dataset = torch.utils.data.Subset(val_dataset_full, val_idx)
+    
+    # 创建数据加载器
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=Config.batch_size,
+        shuffle=True,
+        num_workers=Config.num_workers,
+        pin_memory=True
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=Config.batch_size,
+        shuffle=False,
+        num_workers=Config.num_workers,
+        pin_memory=True
+    )
+    
+    print(f"Training samples: {len(train_dataset)}")
+    print(f"Validation samples: {len(val_dataset)}")
+    
+    # 创建模型
+    model = UNet(in_channels=3, out_channels=1).to(Config.device)
+    
+    # 损失函数和优化器
+    criterion = DiceBCELoss(weight=0.7)
+    optimizer = optim.Adam(model.parameters(), lr=Config.learning_rate)
+    
+    # 使用StepLR调度器
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+    
+    # 训练循环
+    best_val_loss = float('inf')
+    train_losses = []
+    val_losses = []
+    val_dices = []
+    
+    for epoch in range(Config.num_epochs):
+        # 训练阶段
+        model.train()
+        epoch_train_loss = 0.0
+        
+        train_bar = tqdm(train_loader, desc=f'Epoch [{epoch+1}/{Config.num_epochs}] Train')
+        for batch_idx, (images, masks) in enumerate(train_bar):
+            images, masks = images.to(Config.device), masks.to(Config.device)
+            
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, masks)
+            loss.backward()
+            optimizer.step()
+            
+            epoch_train_loss += loss.item()
+            train_bar.set_postfix(loss=loss.item())
+        
+        avg_train_loss = epoch_train_loss / len(train_loader)
+        train_losses.append(avg_train_loss)
+        
+        # 验证阶段
+        model.eval()
+        epoch_val_loss = 0.0
+        val_dice_scores = []
+        
+        with torch.no_grad():
+            val_bar = tqdm(val_loader, desc=f'Epoch [{epoch+1}/{Config.num_epochs}] Val')
+            for images, masks in val_bar:
+                images, masks = images.to(Config.device), masks.to(Config.device)
+                outputs = model(images)
+                
+                loss = criterion(outputs, masks)
+                epoch_val_loss += loss.item()
+                
+                # 计算Dice分数
+                preds = (outputs > 0.5).float()
+                dice_score = compute_dice_score(preds, masks)
+                val_dice_scores.append(dice_score)
+                
+                val_bar.set_postfix(loss=loss.item(), dice=dice_score)
+        
+        avg_val_loss = epoch_val_loss / len(val_loader)
+        avg_dice_score = np.mean(val_dice_scores)
+        val_losses.append(avg_val_loss)
+        val_dices.append(avg_dice_score)
+        
+        # 更新学习率
+        scheduler.step()
+        
+        print(f'Epoch {epoch+1}/{Config.num_epochs}: '
+              f'Train Loss: {avg_train_loss:.4f}, '
+              f'Val Loss: {avg_val_loss:.4f}, '
+              f'Val Dice: {avg_dice_score:.4f}, '
+              f'LR: {optimizer.param_groups[0]["lr"]:.6f}')
+        
+        # 保存最佳模型
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            # 只保存模型权重，避免保存整个checkpoint导致的加载问题
+            torch.save(model.state_dict(), '/kaggle/working/best_model_weights.pth')
+            print(f'Best model saved with val loss: {avg_val_loss:.4f}, dice: {avg_dice_score:.4f}')
+    
+    # 绘制训练曲线
+    plt.figure(figsize=(15, 5))
+    
+    plt.subplot(1, 3, 1)
+    plt.plot(train_losses, label='Train Loss')
+    plt.plot(val_losses, label='Val Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training and Validation Loss')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.subplot(1, 3, 2)
+    plt.plot(val_dices, label='Val Dice', color='green')
+    plt.xlabel('Epoch')
+    plt.ylabel('Dice Score')
+    plt.title('Validation Dice Score')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.subplot(1, 3, 3)
+    plt.plot(val_losses, label='Val Loss', color='orange')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Validation Loss Detail')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig('/kaggle/working/training_history.png', dpi=100)
+    plt.show()
+    
+    print('Training completed!')
+
+# ============ 预测函数 ============
+def predict():
+    print(f"Using device: {Config.device}")
+    print(f"Test images: {Config.test_image_dir}")
+    
+    # 检查测试目录
+    if not os.path.exists(Config.test_image_dir):
+        print(f"Error: Test image directory '{Config.test_image_dir}' does not exist!")
+        return
+    
+    # 创建预测结果目录
+    os.makedirs(Config.prediction_dir, exist_ok=True)
+    
+    # 加载模型
+    model = UNet(in_channels=3, out_channels=1).to(Config.device)
+    
+    model_path = '/kaggle/working/best_model_weights.pth'
+    if os.path.exists(model_path):
+        try:
+            # 方法1: 使用weights_only=False加载
+            model.load_state_dict(torch.load(model_path, map_location=Config.device, weights_only=False))
+            print(f"Loaded model weights from {model_path}")
+        except Exception as e1:
+            try:
+                # 方法2: 尝试安全加载
+                model.load_state_dict(torch.load(model_path, map_location=Config.device))
+                print(f"Loaded model weights from {model_path} (safe load)")
+            except Exception as e2:
+                print(f"Error loading model: {e2}")
+                print("Using randomly initialized model")
+    else:
+        print("Error: No trained model found! Please train the model first.")
+        return
+    
+    model.eval()
+    
+    # 创建测试数据集
+    test_transform = get_val_transform()
+    test_dataset = FundusDataset(
+        image_dir=Config.test_image_dir,
+        transform=test_transform,
+        train=False
+    )
+    
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=1
+    )
+    
+    print(f"Found {len(test_dataset)} test images")
+    
+    # 进行预测
+    with torch.no_grad():
+        for images, img_names in tqdm(test_loader, desc='Predicting'):
+            images = images.to(Config.device)
+            outputs = model(images)
+            
+            # 应用阈值得到二值分割结果
+            preds = (outputs > 0.5).float()
+            
+            # 转换为numpy数组
+            pred_np = preds[0, 0].cpu().numpy()
+            
+            # 根据任务要求：血管为0，背景为255
+            # 我们的预测中血管为1，背景为0，所以需要反转
+            pred_np = (1 - pred_np) * 255  # 血管变成0，背景变成255
+            pred_np = pred_np.astype(np.uint8)
+            
+            # 保存预测图像
+            img_name = img_names[0]
+            save_path = os.path.join(Config.prediction_dir, img_name)
+            
+            # 使用PIL保存
+            pred_image = Image.fromarray(pred_np)
+            pred_image.save(save_path)
+    
+    print(f"All predictions saved to {Config.prediction_dir}")
+    
+    # 运行提供的segmentation_to_csv.py
+    run_segmentation_to_csv()
+
+# ============ 运行提供的segmentation_to_csv.py ============
+def run_segmentation_to_csv():
+    """运行提供的segmentation_to_csv.py"""
+    # 创建segmentation_to_csv.py文件内容
+    segmentation_to_csv_content = '''import numpy as np
+import pandas as pd
+from PIL import Image
+import torchvision
+import os
+
+def get_img_file(image_dir):
+    imagelist = []
+    namelist = []
+    for parent, dirnames, filenames in os.walk(image_dir):
+        for filename in filenames:
+            if filename.lower().endswith(
+                    ('.bmp', '.dib', '.png', '.jpg', '.jpeg', '.pbm', '.pgm', '.ppm', '.tif', '.gif')):
+                imagelist.append(os.path.join(parent, filename))
+                namelist.append(filename)
+        return imagelist, namelist
+
+def turn_to_str(image_list):
+    outputs = []
+    for image_path in image_list:
+        image = Image.open(image_path).convert('L')
+        transform = torchvision.transforms.ToTensor()
+        image = image.resize((512, 512), Image.Resampling.BILINEAR)
+        image = transform(image)
+        image[image > 0] = 1
+        dots = np.where(image.flatten() == 1)[0]
+        run_lengths = []
+        prev = -2
+        for b in dots:
+            if (b > prev + 1):
+                run_lengths.extend((b + 1, 0))
+            run_lengths[-1] += 1
+            prev = b
+        output = ' '.join([str(r) for r in run_lengths])
+        outputs.append(output)
+    return outputs
+
+def save_to_csv(name_list, str_list):
+    df = pd.DataFrame(columns=['Id', 'Predicted'])
+    df['Id'] = [i.split('.')[0] for i in name_list]
+    df['Predicted'] = str_list
+    df.to_csv('/kaggle/working/submission.csv', index=None)
+
+if __name__=="__main__":
+    image_dir = '/kaggle/working/image'
+    image_list, name_list = get_img_file(image_dir)
+    str_list = turn_to_str(image_list)
+    save_to_csv(name_list, str_list)
+    print("Submission file generated: /kaggle/working/submission.csv")
+'''
+    
+    # 保存segmentation_to_csv.py文件
+    with open('/kaggle/working/segmentation_to_csv.py', 'w') as f:
+        f.write(segmentation_to_csv_content)
+    
+    print("Running segmentation_to_csv.py...")
+    
+    try:
+        # 导入并运行segmentation_to_csv.py
+        import sys
+        sys.path.append('/kaggle/working')
+        
+        # 动态执行代码
+        exec(segmentation_to_csv_content.replace('if __name__=="__main__":', 'if True:'))
+        
+        # 检查生成的提交文件
+        if os.path.exists('/kaggle/working/submission.csv'):
+            print("Successfully generated submission.csv")
+            
+            # 显示提交文件信息
+            df = pd.read_csv('/kaggle/working/submission.csv')
+            print(f"\nSubmission file info:")
+            print(f"Total rows: {len(df)}")
+            print(f"Columns: {df.columns.tolist()}")
+            
+            # 显示前几行
+            print("\nFirst few rows:")
+            print(df.head())
+            
+            # 检查空预测
+            empty_predictions = sum(1 for x in df['Predicted'] if pd.isna(x) or x == '')
+            print(f"\nEmpty predictions: {empty_predictions}")
+        else:
+            print("Error: submission.csv was not created!")
+            
+    except Exception as e:
+        print(f"Error running segmentation_to_csv.py: {e}")
+        print("Trying manual generation...")
+        generate_submission_manual()
+
+# ============ 手动生成提交文件 ============
+def generate_submission_manual():
+    """手动生成符合要求的提交文件"""
+    
+    def rle_encoding(mask):
+        """运行长度编码"""
+        pixels = mask.flatten()
+        # 血管为0，背景为255，所以我们需要找到值为0的像素
+        vessel_pixels = np.where(pixels == 0)[0]
+        
+        if len(vessel_pixels) == 0:
+            return ''
+        
+        # 运行长度编码
+        run_lengths = []
+        prev = -2
+        for b in vessel_pixels:
+            if b > prev + 1:
+                run_lengths.extend([b + 1, 0])  # +1因为索引从1开始
+            run_lengths[-1] += 1
+            prev = b
+        
+        return ' '.join(str(r) for r in run_lengths)
+    
+    # 获取预测图像
+    image_list = []
+    name_list = []
+    
+    for filename in sorted(os.listdir(Config.prediction_dir)):
+        if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tif')):
+            image_list.append(os.path.join(Config.prediction_dir, filename))
+            name_list.append(filename)
+    
+    print(f"Found {len(image_list)} prediction images")
+    
+    # 生成编码
+    outputs = []
+    for image_path in tqdm(image_list, desc='Encoding predictions'):
+        # 读取图像并转换为二值
+        image = Image.open(image_path).convert('L')
+        
+        # 确保尺寸为512x512
+        image = image.resize((512, 512), Image.Resampling.BILINEAR)
+        
+        # 转换为numpy数组
+        mask = np.array(image)
+        
+        # 应用阈值确保二值化
+        mask = (mask < 128).astype(np.uint8)  # 血管为1，背景为0
+        
+        # 运行长度编码
+        encoded = rle_encoding(mask)
+        outputs.append(encoded)
+    
+    # 创建提交DataFrame
+    df = pd.DataFrame({
+        'Id': [os.path.splitext(name)[0] for name in name_list],
+        'Predicted': outputs
+    })
+    
+    # 保存为CSV
+    df.to_csv('/kaggle/working/submission.csv', index=False)
+    print(f"Submission file saved to /kaggle/working/submission.csv")
+    
+    # 显示统计信息
+    print("\nSubmission statistics:")
+    print(f"Total images: {len(df)}")
+    
+    # 计算平均编码长度
+    encoded_lengths = [len(str(x).split()) for x in df['Predicted']]
+    print(f"Average RLE length: {np.mean(encoded_lengths):.1f} elements")
+    
+    # 检查空预测
+    empty_predictions = sum(1 for x in df['Predicted'] if x == '')
+    print(f"Empty predictions: {empty_predictions}")
+
+# ============ 主函数 ============
+def main():
+    print("=" * 60)
+    print("2D Fundus Image Vessel Segmentation System")
+    print("=" * 60)
+    
+    print(f"\nDevice: {Config.device}")
+    print(f"Training images: {len(os.listdir(Config.train_image_dir))}")
+    print(f"Test images: {len(os.listdir(Config.test_image_dir))}")
+    
+    print("\nStarting training...")
+    train()
+    
+    print("\nStarting prediction...")
+    predict()
+    
+    print("\nProcess completed!")
+    print(f"Check the following files in /kaggle/working/:")
+    print(f"1. best_model_weights.pth - Trained model weights")
+    print(f"2. training_history.png - Training curves")
+    print(f"3. image/ - Directory with prediction images")
+    print(f"4. submission.csv - Final submission file")
+
+if __name__ == "__main__":
+    main()
