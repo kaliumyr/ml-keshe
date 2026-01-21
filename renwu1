@@ -1,0 +1,527 @@
+# ============================
+# 植物图像分类 - 高效特征工程版
+# ============================
+
+import os
+import cv2
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+import warnings
+import joblib
+warnings.filterwarnings('ignore')
+
+# 机器学习库
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.metrics import f1_score, classification_report
+from sklearn.ensemble import RandomForestClassifier, VotingClassifier
+from xgboost import XGBClassifier
+from sklearn.svm import SVC
+
+# ============================
+# 1. 配置参数
+# ============================
+class Config:
+    # 路径配置
+    DATA_DIR = "./plant_dataset"
+    TRAIN_DIR = os.path.join(DATA_DIR, "train")
+    TEST_DIR = os.path.join(DATA_DIR, "test")
+    MODEL_SAVE_DIR = "./models_efficient"
+    SUBMISSION_FILE = "./submission-for-task1.csv"
+    
+    # 图像处理参数
+    IMG_SIZE = (128, 128)  # 优化速度
+    
+    # 颜色特征参数
+    GREEN_LOWER = np.array([35, 40, 40])
+    GREEN_UPPER = np.array([85, 255, 255])
+    
+    # 训练参数
+    RANDOM_STATE = 42
+    
+    # 类别
+    CLASSES = [
+        'Black-grass', 
+        'Common wheat', 
+        'Loose Silky-bent', 
+        'Scentless Mayweed', 
+        'Sugar beet'
+    ]
+
+config = Config()
+os.makedirs(config.MODEL_SAVE_DIR, exist_ok=True)
+
+# ============================
+# 2. 数据加载器
+# ============================
+class DataLoader:
+    def __init__(self, config):
+        self.config = config
+        self.label_encoder = LabelEncoder()
+        
+    def load_data(self):
+        """加载训练数据"""
+        images = []
+        labels = []
+        
+        print("正在加载训练数据...")
+        for class_name in self.config.CLASSES:
+            class_dir = os.path.join(self.config.TRAIN_DIR, class_name)
+            if not os.path.exists(class_dir):
+                print(f"警告: 目录 {class_dir} 不存在")
+                continue
+                
+            img_files = os.listdir(class_dir)
+            print(f"类别 {class_name}: {len(img_files)} 张图片")
+            
+            for img_file in tqdm(img_files, desc=f"加载 {class_name}", leave=False):
+                img_path = os.path.join(class_dir, img_file)
+                try:
+                    img = cv2.imread(img_path)
+                    if img is None:
+                        continue
+                    
+                    img = cv2.resize(img, self.config.IMG_SIZE)
+                    images.append(img)
+                    labels.append(class_name)
+                    
+                except Exception as e:
+                    print(f"加载失败 {img_path}: {e}")
+        
+        print(f"\n总共加载 {len(images)} 张训练图像")
+        return np.array(images), np.array(labels)
+    
+    def load_test_data(self):
+        """加载测试数据"""
+        if not os.path.exists(self.config.TEST_DIR):
+            print(f"测试目录不存在: {self.config.TEST_DIR}")
+            return np.array([]), np.array([])
+        
+        print("正在加载测试数据...")
+        img_files = sorted(os.listdir(self.config.TEST_DIR))
+        
+        test_images = []
+        test_filenames = []
+        
+        for img_file in tqdm(img_files, desc="加载测试图像"):
+            img_path = os.path.join(self.config.TEST_DIR, img_file)
+            try:
+                img = cv2.imread(img_path)
+                if img is None:
+                    continue
+                
+                img = cv2.resize(img, self.config.IMG_SIZE)
+                test_images.append(img)
+                test_filenames.append(img_file)
+                
+            except Exception as e:
+                print(f"加载失败 {img_path}: {e}")
+        
+        print(f"加载了 {len(test_images)} 个测试图像")
+        return np.array(test_images), np.array(test_filenames)
+    
+    def encode_labels(self, labels):
+        """编码标签"""
+        return self.label_encoder.fit_transform(labels)
+    
+    def decode_labels(self, encoded_labels):
+        """解码标签"""
+        return self.label_encoder.inverse_transform(encoded_labels)
+
+# ============================
+# 3. 高效特征提取器（修复版）
+# ============================
+class EfficientFeatureExtractor:
+    def __init__(self, config):
+        self.config = config
+        # 预计算特征维度
+        self.feature_dim = self._calculate_feature_dim()
+        
+    def _calculate_feature_dim(self):
+        """计算特征维度以确保一致性"""
+        # 颜色特征: 绿色比例(1) + BGR均值(3) = 4
+        # 纹理特征: Sobel均值+标准差(2) = 2
+        # 形状特征: 面积+周长+圆度(3) + Hu矩(3) = 6
+        # 边缘特征: 边缘密度(1) = 1
+        # 颜色直方图: H通道直方图(8) = 8
+        total = 4 + 2 + 6 + 1 + 8
+        return total
+    
+    def extract_features_single(self, img):
+        """提取单张图像的特征 - 确保维度一致"""
+        features = []
+        
+        # 1. 转换为HSV
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        
+        # 2. 提取绿色区域
+        mask = cv2.inRange(hsv, self.config.GREEN_LOWER, self.config.GREEN_UPPER)
+        
+        # 3. 颜色特征
+        green_ratio = np.sum(mask > 0) / (mask.shape[0] * mask.shape[1])
+        features.append(green_ratio)
+        
+        # BGR均值
+        if np.sum(mask) > 0:
+            for i in range(3):
+                mean_val = cv2.mean(img[:, :, i], mask=mask)[0]
+                features.append(mean_val)
+        else:
+            features.extend([0.0, 0.0, 0.0])
+        
+        # 4. 纹理特征
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # Sobel梯度
+        sobelx = cv2.Sobel(gray, cv2.CV_16S, 1, 0, ksize=3)
+        sobely = cv2.Sobel(gray, cv2.CV_16S, 0, 1, ksize=3)
+        gradient = np.abs(sobelx) + np.abs(sobely)
+        
+        features.extend([
+            float(np.mean(gradient)),
+            float(np.std(gradient))
+        ])
+        
+        # 5. 形状特征（确保固定维度）
+        if np.sum(mask) > 100:
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                contour = max(contours, key=cv2.contourArea)
+                area = cv2.contourArea(contour)
+                perimeter = cv2.arcLength(contour, True)
+                
+                if perimeter > 0:
+                    circularity = 4 * np.pi * area / (perimeter * perimeter)
+                else:
+                    circularity = 0.0
+                
+                features.extend([float(area), float(perimeter), float(circularity)])
+                
+                # Hu矩（只取前3个）
+                moments = cv2.moments(contour)
+                hu = cv2.HuMoments(moments)
+                for i in range(3):
+                    if hu[i] != 0:
+                        hu_val = -1 * np.sign(hu[i]) * np.log10(abs(hu[i]))
+                        features.append(float(hu_val))
+                    else:
+                        features.append(0.0)
+            else:
+                # 没有轮廓时填充0
+                features.extend([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        else:
+            # 绿色区域不足时填充0
+            features.extend([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        
+        # 6. 边缘特征
+        edges = cv2.Canny(gray, 50, 150)
+        edge_density = np.sum(edges > 0) / (edges.shape[0] * edges.shape[1])
+        features.append(float(edge_density))
+        
+        # 7. 颜色直方图特征（固定8维）
+        h_hist = cv2.calcHist([hsv], [0], mask, [8], [0, 180])
+        h_hist = cv2.normalize(h_hist, h_hist).flatten()
+        features.extend([float(x) for x in h_hist])
+        
+        # 确保特征维度正确
+        features = features[:self.feature_dim]
+        if len(features) < self.feature_dim:
+            features.extend([0.0] * (self.feature_dim - len(features)))
+        
+        return np.array(features, dtype=np.float32)
+    
+    def extract_features_batch(self, images):
+        """批量提取特征"""
+        print("正在提取特征...")
+        features_list = []
+        
+        for img in tqdm(images, desc="特征提取进度"):
+            try:
+                features = self.extract_features_single(img)
+                features_list.append(features)
+            except Exception as e:
+                print(f"特征提取失败: {e}")
+                # 返回零向量保持维度一致
+                features_list.append(np.zeros(self.feature_dim, dtype=np.float32))
+        
+        features_array = np.array(features_list)
+        print(f"特征提取完成，特征维度: {features_array.shape}")
+        
+        # 处理NaN值
+        features_array = np.nan_to_num(features_array)
+        
+        return features_array
+
+# ============================
+# 4. 简化分类器
+# ============================
+class EfficientClassifier:
+    def __init__(self, config):
+        self.config = config
+        self.scaler = StandardScaler()
+        self.best_model = None
+        
+    def create_ensemble(self):
+        """创建集成模型"""
+        models = {
+            'RandomForest': RandomForestClassifier(
+                n_estimators=100,
+                max_depth=12,
+                class_weight='balanced',
+                random_state=self.config.RANDOM_STATE,
+                n_jobs=-1
+            ),
+            
+            'XGBoost': XGBClassifier(
+                n_estimators=100,
+                max_depth=6,
+                learning_rate=0.1,
+                use_label_encoder=False,
+                eval_metric='mlogloss',
+                random_state=self.config.RANDOM_STATE,
+                n_jobs=-1
+            )
+        }
+        
+        return models
+    
+    def train(self, X, y):
+        """训练模型"""
+        print("\n训练集成模型...")
+        
+        models = self.create_ensemble()
+        trained_models = []
+        
+        # 训练基模型
+        for name, model in models.items():
+            print(f"训练 {name}...")
+            model.fit(X, y)
+            trained_models.append((name, model))
+        
+        # 创建投票分类器
+        voting_clf = VotingClassifier(
+            estimators=trained_models,
+            voting='soft',
+            n_jobs=-1
+        )
+        
+        voting_clf.fit(X, y)
+        self.best_model = voting_clf
+        
+        print("集成模型训练完成")
+        return voting_clf
+    
+    def predict(self, X):
+        """预测"""
+        if self.best_model is None:
+            raise ValueError("模型未训练")
+        return self.best_model.predict(X)
+
+# ============================
+# 5. 主流程
+# ============================
+def main():
+    print("="*80)
+    print("植物图像分类 - 高效特征工程版")
+    print("="*80)
+    
+    # 记录开始时间
+    import time
+    start_time = time.time()
+    
+    # 1. 加载数据
+    print("\n1. 加载数据...")
+    data_loader = DataLoader(config)
+    images, labels = data_loader.load_data()
+    
+    if len(images) == 0:
+        print("错误: 未加载到任何图像数据")
+        return
+    
+    print(f"训练数据形状: {images.shape}")
+    
+    # 2. 提取特征
+    print("\n2. 提取特征...")
+    feature_extractor = EfficientFeatureExtractor(config)
+    X = feature_extractor.extract_features_batch(images)
+    y = data_loader.encode_labels(labels)
+    
+    print(f"\n特征矩阵: {X.shape}")
+    print(f"标签分布: {np.bincount(y)}")
+    
+    # 3. 特征标准化
+    print("\n3. 特征标准化...")
+    classifier = EfficientClassifier(config)
+    X_scaled = classifier.scaler.fit_transform(X)
+    
+    # 4. 划分数据集进行简单验证
+    print("\n4. 划分数据集...")
+    if len(X_scaled) > 100:
+        X_train, X_val, y_train, y_val = train_test_split(
+            X_scaled, y, test_size=0.2, stratify=y, random_state=config.RANDOM_STATE
+        )
+        
+        print(f"训练集: {X_train.shape}, 验证集: {X_val.shape}")
+        
+        # 5. 训练模型
+        print("\n5. 训练模型...")
+        model = classifier.train(X_train, y_train)
+        
+        # 6. 验证
+        print("\n6. 验证模型...")
+        y_pred = model.predict(X_val)
+        f1 = f1_score(y_val, y_pred, average='macro')
+        
+        print(f"验证集F1分数: {f1:.4f}")
+        print("\n分类报告:")
+        print(classification_report(y_val, y_pred, target_names=config.CLASSES))
+        
+        # 在整个数据集上重新训练
+        print("\n7. 在整个数据集上重新训练...")
+        model = classifier.train(X_scaled, y)
+    else:
+        # 数据量少时直接训练
+        print("\n5. 训练模型...")
+        model = classifier.train(X_scaled, y)
+    
+    # 8. 处理测试集
+    print("\n8. 处理测试集...")
+    test_images, test_filenames = data_loader.load_test_data()
+    
+    if len(test_images) > 0:
+        print(f"提取测试特征...")
+        X_test = feature_extractor.extract_features_batch(test_images)
+        X_test_scaled = classifier.scaler.transform(X_test)
+        
+        print("进行预测...")
+        test_predictions = classifier.predict(X_test_scaled)
+        test_labels = data_loader.decode_labels(test_predictions)
+        
+        # 生成提交文件
+        print(f"\n9. 生成提交文件: {config.SUBMISSION_FILE}")
+        submission_df = pd.DataFrame({
+            'ID': test_filenames,
+            'Category': test_labels
+        })
+        
+        submission_df.to_csv(config.SUBMISSION_FILE, index=False)
+        print(f"提交文件已保存到: {config.SUBMISSION_FILE}")
+        print(f"总共预测了 {len(submission_df)} 个样本")
+        
+        # 显示预测分布
+        print("\n预测类别分布:")
+        dist = submission_df['Category'].value_counts()
+        for cls in config.CLASSES:
+            count = dist.get(cls, 0)
+            print(f"  {cls}: {count}张 ({count/len(submission_df)*100:.1f}%)")
+        
+        print("\n提交文件前10行:")
+        print(submission_df.head(10))
+    else:
+        print("没有测试数据可用")
+    
+    # 10. 保存模型
+    print("\n10. 保存模型...")
+    model_path = os.path.join(config.MODEL_SAVE_DIR, "efficient_model.pkl")
+    joblib.dump({
+        'model': classifier.best_model,
+        'scaler': classifier.scaler,
+        'label_encoder': data_loader.label_encoder,
+        'feature_extractor': feature_extractor
+    }, model_path)
+    
+    # 计算总时间
+    end_time = time.time()
+    total_time = end_time - start_time
+    
+    print("\n" + "="*80)
+    print("程序执行完成!")
+    print(f"总运行时间: {total_time:.1f}秒 ({total_time/60:.1f}分钟)")
+    print("="*80)
+
+# ============================
+# 运行程序
+# ============================
+if __name__ == "__main__":
+    if not os.path.exists(config.TRAIN_DIR):
+        print(f"错误: 训练目录不存在: {config.TRAIN_DIR}")
+        print("请确保数据集目录结构正确:")
+        print(f"{config.TRAIN_DIR}/")
+        for cls in config.CLASSES:
+            print(f"  ├── {cls}/")
+        print(f"\n{config.TEST_DIR}/")
+        print("  ├── image1.png")
+        print("  ├── image2.png")
+        print("  └── ...")
+    else:
+        try:
+            main()
+        except Exception as e:
+            print(f"\n程序运行出错: {e}")
+            print("\n尝试简化版...")
+            try:
+                # 如果出错，尝试更简化的版本
+                run_simple_version()
+            except Exception as e2:
+                print(f"简化版也出错: {e2}")
+                print("\n请检查：")
+                print("1. 数据集路径是否正确")
+                print("2. OpenCV是否正确安装: pip install opencv-python")
+                print("3. 其他依赖: pip install scikit-learn xgboost pandas numpy")
+
+def run_simple_version():
+    """极简版本"""
+    print("\n运行极简版本...")
+    
+    # 只使用最简单的特征
+    data_loader = DataLoader(config)
+    images, labels = data_loader.load_data()
+    
+    if len(images) == 0:
+        return
+    
+    # 提取最简单的特征：绿色比例 + 平均颜色
+    features = []
+    for img in tqdm(images, desc="提取简单特征"):
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, config.GREEN_LOWER, config.GREEN_UPPER)
+        green_ratio = np.sum(mask > 0) / (mask.shape[0] * mask.shape[1])
+        avg_color = np.mean(img, axis=(0, 1))
+        features.append(np.concatenate([avg_color, [green_ratio]]))
+    
+    X = np.array(features)
+    y = data_loader.encode_labels(labels)
+    
+    # 简单训练
+    model = RandomForestClassifier(
+        n_estimators=50,
+        class_weight='balanced',
+        random_state=config.RANDOM_STATE,
+        n_jobs=-1
+    )
+    model.fit(X, y)
+    
+    # 预测测试集
+    test_images, test_filenames = data_loader.load_test_data()
+    if len(test_images) > 0:
+        test_features = []
+        for img in test_images:
+            hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+            mask = cv2.inRange(hsv, config.GREEN_LOWER, config.GREEN_UPPER)
+            green_ratio = np.sum(mask > 0) / (mask.shape[0] * mask.shape[1])
+            avg_color = np.mean(img, axis=(0, 1))
+            test_features.append(np.concatenate([avg_color, [green_ratio]]))
+        
+        X_test = np.array(test_features)
+        predictions = model.predict(X_test)
+        pred_labels = data_loader.decode_labels(predictions)
+        
+        submission_df = pd.DataFrame({
+            'ID': test_filenames,
+            'Category': pred_labels
+        })
+        submission_df.to_csv(config.SUBMISSION_FILE, index=False)
+        print(f"提交文件已生成: {config.SUBMISSION_FILE}")
+    
+    print("极简版本完成!")
