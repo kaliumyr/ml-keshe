@@ -1,0 +1,811 @@
+# ============ 1. 导入库 ============
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, random_split
+from torchvision import transforms, models
+from torchvision.models import ResNet18_Weights
+from PIL import Image
+from pathlib import Path
+import os
+import matplotlib.pyplot as plt
+from sklearn.model_selection import KFold
+import warnings
+warnings.filterwarnings('ignore')
+
+# ============ 2. 数据分析 ============
+def analyze_dataset(data_path):
+    """
+    分析数据集构成
+    """
+    print("=" * 50)
+    print("数据集分析报告")
+    print("=" * 50)
+    
+    # 在类别分布部分添加数字标签
+    emotion_classes = ["Angry", "Fear", "Happy", "Sad", "Surprise", "Neutral"]
+    emotion_nums = ["0", "1", "2", "3", "4", "5"]  # 对应的数字标签
+    
+    train_path = os.path.join(data_path, "train")
+    test_path = os.path.join(data_path, "test")
+    
+    # 检查目录结构
+    print(f"训练集路径: {train_path}")
+    print(f"测试集路径: {test_path}")
+    
+    # 分析训练集类别分布
+    if os.path.exists(train_path):
+        class_counts = {}
+        
+        print("\n训练集类别分布:")
+        for i, emotion in enumerate(emotion_classes):
+            emotion_dir = os.path.join(train_path, emotion)
+            if os.path.exists(emotion_dir):
+                count = len([f for f in os.listdir(emotion_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
+                class_counts[emotion] = count
+                print(f"  {emotion} (类别 {emotion_nums[i]}): {count} 张图片")
+        
+        # 绘制类别分布图
+        plt.figure(figsize=(12, 5))
+        
+        # 创建x轴标签（显示数字）
+        x_labels = [f"{emotion}\n(类别 {num})" for emotion, num in zip(emotion_classes, emotion_nums)]
+        
+        bars = plt.bar(x_labels, [class_counts.get(e, 0) for e in emotion_classes])
+        plt.title('训练集类别分布', fontsize=14)
+        plt.xlabel('情感类别（数字标签）', fontsize=12)
+        plt.ylabel('样本数量', fontsize=12)
+        plt.xticks(rotation=45)
+        
+        # 在柱状图上显示数值
+        for bar, count in zip(bars, [class_counts.get(e, 0) for e in emotion_classes]):
+            if count > 0:
+                plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 5, 
+                        str(count), ha='center', va='bottom', fontsize=10)
+        
+        plt.tight_layout()
+        plt.show()
+        
+        # 分析样本总数
+        total_samples = sum(class_counts.values())
+        print(f"\n训练集总样本数: {total_samples}")
+        print(f"类别数量: {len(class_counts)}")
+        
+        # 检查类别不平衡
+        if class_counts:
+            max_count = max(class_counts.values())
+            min_count = min(class_counts.values())
+            imbalance_ratio = max_count / min_count if min_count > 0 else float('inf')
+            
+            print(f"\n类别不平衡分析:")
+            print(f"  最多样本类别: {max_count}")
+            print(f"  最少样本类别: {min_count}")
+            print(f"  不平衡比例: {imbalance_ratio:.2f}")
+            
+            if imbalance_ratio > 5:
+                print("  ⚠️  警告: 存在明显的类别不平衡问题!")
+            else:
+                print("  ✅ 类别分布相对均衡")
+    
+    # 分析测试集
+    if os.path.exists(test_path):
+        test_files = [f for f in os.listdir(test_path) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+        print(f"\n测试集样本数: {len(test_files)}")
+    
+    print("=" * 50)
+
+# ============ 3. 数据增强与预处理 ============
+class EmotionDataAugmentation:
+    """数据增强策略"""
+    
+    @staticmethod
+    def get_train_transforms():
+        """训练集数据增强变换"""
+        return transforms.Compose([
+            transforms.Grayscale(num_output_channels=1),
+            transforms.Resize((48, 48)),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomRotation(degrees=10),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5], std=[0.5])
+        ])
+    
+    @staticmethod
+    def get_val_transforms():
+        """验证集/测试集变换"""
+        return transforms.Compose([
+            transforms.Grayscale(num_output_channels=1),
+            transforms.Resize((48, 48)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5], std=[0.5])
+        ])
+
+# ============ 4. 数据集类（支持交叉验证） ============
+class FERDataset(Dataset):
+    def __init__(self, image_dir, mode='train', transform=None, fold_idx=None, total_folds=5):
+        self.image_dir = Path(image_dir)
+        self.mode = mode
+        self.transform = transform
+        self.samples = []
+        self.class_to_idx = {
+            "Angry": 0, "Fear": 1, "Happy": 2, 
+            "Sad": 3, "Surprise": 4, "Neutral": 5
+        }
+        self.idx_to_class = {v: k for k, v in self.class_to_idx.items()}
+        self.fold_idx = fold_idx
+        self.total_folds = total_folds
+        
+        self._load_data()
+        
+        # 如果是训练模式且指定了fold，则进行交叉验证划分
+        if self.mode == 'train' and fold_idx is not None:
+            self._kfold_split()
+    
+    def _load_data(self):
+        """加载数据"""
+        if self.mode == "train":
+            # 有标签的训练数据
+            for emotion_name, label in self.class_to_idx.items():
+                emotion_dir = self.image_dir / emotion_name
+                if emotion_dir.exists():
+                    for img_file in emotion_dir.glob("*"):
+                        if img_file.suffix.lower() in ['.jpg', '.jpeg', '.png']:
+                            self.samples.append((str(img_file), label))
+        else:
+            # 无标签的测试数据
+            for img_file in self.image_dir.glob("*"):
+                if img_file.suffix.lower() in ['.jpg', '.jpeg', '.png']:
+                    self.samples.append((str(img_file), -1))  # -1表示无标签
+    
+    def _kfold_split(self):
+        """K折交叉验证划分"""
+        # 按类别分组以保持分布
+        from collections import defaultdict
+        class_samples = defaultdict(list)
+        
+        for img_path, label in self.samples:
+            class_samples[label].append((img_path, label))
+        
+        train_samples = []
+        val_samples = []
+        
+        for label, samples in class_samples.items():
+            n_samples = len(samples)
+            fold_size = n_samples // self.total_folds
+            
+            # 计算当前fold的索引范围
+            start_idx = self.fold_idx * fold_size
+            end_idx = (self.fold_idx + 1) * fold_size if self.fold_idx < self.total_folds - 1 else n_samples
+            
+            # 验证集
+            val_samples.extend(samples[start_idx:end_idx])
+            # 训练集
+            train_samples.extend(samples[:start_idx] + samples[end_idx:])
+        
+        # 根据模式返回相应样本
+        if 'train' in self.mode:
+            self.samples = train_samples
+        elif 'val' in self.mode:
+            self.samples = val_samples
+    
+    def __len__(self):
+        return len(self.samples)
+    
+    def __getitem__(self, idx):
+        img_path, label = self.samples[idx]
+        
+        # 加载图像
+        image = Image.open(img_path).convert('RGB')
+        
+        # 应用变换
+        if self.transform:
+            image = self.transform(image)
+        else:
+            # 默认变换
+            image = transforms.Compose([
+                transforms.Grayscale(num_output_channels=1),
+                transforms.Resize((48, 48)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.5], std=[0.5])
+            ])(image)
+        
+        if self.mode == 'test':
+            return image, img_path
+        else:
+            return image, label
+    
+    def get_class_distribution(self):
+        """获取类别分布"""
+        if self.mode == 'test':
+            return {}
+        
+        distribution = {class_name: 0 for class_name in self.class_to_idx.keys()}
+        for _, label in self.samples:
+            if label != -1:
+                class_name = self.idx_to_class[label]
+                distribution[class_name] += 1
+        
+        return distribution
+
+# ============ 5. 模型架构（使用预训练模型+注意力） ============
+class AttentionBlock(nn.Module):
+    """注意力机制模块"""
+    def __init__(self, in_channels):
+        super().__init__()
+        self.query = nn.Conv2d(in_channels, in_channels // 8, 1)
+        self.key = nn.Conv2d(in_channels, in_channels // 8, 1)
+        self.value = nn.Conv2d(in_channels, in_channels, 1)
+        self.gamma = nn.Parameter(torch.zeros(1))
+        
+    def forward(self, x):
+        batch_size, C, H, W = x.size()
+        
+        # 计算query, key, value
+        query = self.query(x).view(batch_size, -1, H * W).permute(0, 2, 1)
+        key = self.key(x).view(batch_size, -1, H * W)
+        value = self.value(x).view(batch_size, -1, H * W)
+        
+        # 计算注意力权重
+        attention = torch.bmm(query, key)
+        attention = torch.softmax(attention, dim=-1)
+        
+        # 应用注意力
+        out = torch.bmm(value, attention.permute(0, 2, 1))
+        out = out.view(batch_size, C, H, W)
+        
+        # 残差连接
+        out = self.gamma * out + x
+        
+        return out
+
+class EmotionCNNWithAttention(nn.Module):
+    """带注意力机制的CNN模型"""
+    def __init__(self, num_classes=6, pretrained=True, use_attention=True):
+        super().__init__()
+        self.use_attention = use_attention
+        
+        # 加载预训练的ResNet18
+        if pretrained:
+            weights = ResNet18_Weights.IMAGENET1K_V1
+        else:
+            weights = None
+        
+        self.backbone = models.resnet18(weights=weights)
+        
+        # 修改第一层以接受1通道输入
+        original_conv1 = self.backbone.conv1
+        self.backbone.conv1 = nn.Conv2d(
+            1,  # 输入通道改为1（灰度图）
+            original_conv1.out_channels,
+            kernel_size=original_conv1.kernel_size,
+            stride=original_conv1.stride,
+            padding=original_conv1.padding,
+            bias=original_conv1.bias
+        )
+        
+        # 初始化新的第一层权重
+        if pretrained:
+            with torch.no_grad():
+                self.backbone.conv1.weight = nn.Parameter(
+                    original_conv1.weight.mean(dim=1, keepdim=True)
+                )
+        
+        # 在layer2后添加注意力模块
+        if use_attention:
+            self.attention = AttentionBlock(128)
+        
+        # 获取特征维度
+        num_features = self.backbone.fc.in_features
+        
+        # 替换全连接层
+        self.backbone.fc = nn.Sequential(
+            nn.Dropout(0.3),
+            nn.Linear(num_features, 256),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm1d(256),
+            nn.Dropout(0.3),
+            nn.Linear(256, num_classes)
+        )
+    
+    def forward(self, x):
+        # ResNet的前向传播（修改以获取中间特征）
+        x = self.backbone.conv1(x)
+        x = self.backbone.bn1(x)
+        x = self.backbone.relu(x)
+        x = self.backbone.maxpool(x)
+        
+        x = self.backbone.layer1(x)
+        x = self.backbone.layer2(x)
+        
+        # 应用注意力
+        if self.use_attention:
+            x = self.attention(x)
+        
+        x = self.backbone.layer3(x)
+        x = self.backbone.layer4(x)
+        
+        x = self.backbone.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.backbone.fc(x)
+        
+        return x
+
+# ============ 6. 训练和验证函数 ============
+def train_epoch(model, dataloader, criterion, optimizer, device, scheduler=None):
+    """训练一个epoch"""
+    model.train()
+    total_loss = 0
+    correct = 0
+    total = 0
+    
+    for batch_idx, (images, labels) in enumerate(dataloader):
+        images, labels = images.to(device), labels.to(device)
+        
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+        
+        if scheduler:
+            scheduler.step()
+        
+        total_loss += loss.item()
+        _, predicted = outputs.max(1)
+        total += labels.size(0)
+        correct += predicted.eq(labels).sum().item()
+    
+    train_loss = total_loss / len(dataloader)
+    train_acc = 100. * correct / total
+    
+    return train_loss, train_acc
+
+def validate(model, dataloader, criterion, device):
+    """验证模型"""
+    model.eval()
+    total_loss = 0
+    correct = 0
+    total = 0
+    all_predictions = []
+    all_labels = []
+    
+    with torch.no_grad():
+        for images, labels in dataloader:
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            
+            total_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
+            
+            all_predictions.extend(predicted.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+    
+    val_loss = total_loss / len(dataloader)
+    val_acc = 100. * correct / total
+    
+    return val_loss, val_acc, all_predictions, all_labels
+
+# ============ 7. 交叉验证训练 ============
+def cross_validation_train(data_path, num_folds=5, epochs=20, batch_size=64):
+    """K折交叉验证训练"""
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"使用设备: {device}")
+    
+    # 准备数据
+    train_path = os.path.join(data_path, "train")
+    
+    # 存储每折的结果
+    fold_results = []
+    
+    for fold in range(num_folds):
+        print(f"\n{'='*60}")
+        print(f"第 {fold+1}/{num_folds} 折交叉验证")
+        print(f"{'='*60}")
+        
+        # 创建数据集（使用当前折）
+        train_dataset = FERDataset(
+            train_path, 
+            mode='train_fold', 
+            transform=EmotionDataAugmentation.get_train_transforms(),
+            fold_idx=fold,
+            total_folds=num_folds
+        )
+        
+        val_dataset = FERDataset(
+            train_path,
+            mode='val_fold',
+            transform=EmotionDataAugmentation.get_val_transforms(),
+            fold_idx=fold,
+            total_folds=num_folds
+        )
+        
+        print(f"训练集大小: {len(train_dataset)}")
+        print(f"验证集大小: {len(val_dataset)}")
+        
+        # 创建数据加载器
+        train_loader = DataLoader(
+            train_dataset, 
+            batch_size=batch_size, 
+            shuffle=True, 
+            num_workers=2,
+            pin_memory=True
+        )
+        
+        val_loader = DataLoader(
+            val_dataset, 
+            batch_size=batch_size, 
+            shuffle=False, 
+            num_workers=2,
+            pin_memory=True
+        )
+        
+        # 创建模型
+        model = EmotionCNNWithAttention(
+            num_classes=6,
+            pretrained=True,
+            use_attention=True
+        ).to(device)
+        
+        # 使用多GPU
+        if torch.cuda.device_count() > 1:
+            print(f"使用 {torch.cuda.device_count()} 块GPU")
+            model = nn.DataParallel(model)
+        
+        # 定义损失函数和优化器
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-4)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        
+        # 训练历史记录
+        history = {
+            'train_loss': [], 'train_acc': [],
+            'val_loss': [], 'val_acc': []
+        }
+        
+        best_val_acc = 0
+        best_model_state = None
+        
+        # 训练循环
+        for epoch in range(epochs):
+            train_loss, train_acc = train_epoch(
+                model, train_loader, criterion, optimizer, device, scheduler
+            )
+            
+            val_loss, val_acc, _, _ = validate(
+                model, val_loader, criterion, device
+            )
+            
+            # 记录历史
+            history['train_loss'].append(train_loss)
+            history['train_acc'].append(train_acc)
+            history['val_loss'].append(val_loss)
+            history['val_acc'].append(val_acc)
+            
+            print(f"Epoch {epoch+1}/{epochs}: "
+                  f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%, "
+                  f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
+            
+            # 保存最佳模型
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_model_state = model.state_dict().copy()
+        
+        # 保存最佳模型
+        torch.save(best_model_state, f'best_model_fold_{fold+1}.pth')
+        print(f"最佳验证准确率: {best_val_acc:.2f}%")
+        
+        fold_results.append({
+            'fold': fold + 1,
+            'best_val_acc': best_val_acc,
+            'history': history,
+            'model_state': best_model_state
+        })
+    
+    # 分析交叉验证结果
+    print(f"\n{'='*60}")
+    print("交叉验证结果汇总")
+    print(f"{'='*60}")
+    
+    val_accs = [result['best_val_acc'] for result in fold_results]
+    mean_val_acc = np.mean(val_accs)
+    std_val_acc = np.std(val_accs)
+    
+    print(f"各折验证准确率: {[f'{acc:.2f}%' for acc in val_accs]}")
+    print(f"平均验证准确率: {mean_val_acc:.2f}%")
+    print(f"标准差: {std_val_acc:.2f}%")
+    
+    return fold_results, mean_val_acc
+
+# ============ 8. 最终模型训练（使用所有数据） ============
+def train_final_model(data_path, epochs=30, batch_size=128):
+    """使用所有训练数据训练最终模型"""
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"训练最终模型，使用设备: {device}")
+    
+    # 准备数据
+    train_path = os.path.join(data_path, "train")
+    test_path = os.path.join(data_path, "test")
+    
+    # 创建完整训练集和验证集（80-20划分）
+    full_dataset = FERDataset(
+        train_path,
+        mode='train',
+        transform=EmotionDataAugmentation.get_train_transforms()
+    )
+    
+    # 划分训练集和验证集
+    train_size = int(0.8 * len(full_dataset))
+    val_size = len(full_dataset) - train_size
+    
+    train_dataset, val_dataset = random_split(
+        full_dataset,
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(42)
+    )
+    
+    print(f"完整训练集大小: {len(train_dataset)}")
+    print(f"最终验证集大小: {len(val_dataset)}")
+    
+    # 创建数据加载器
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True
+    )
+    
+    # 创建测试集
+    test_dataset = FERDataset(
+        test_path,
+        mode='test',
+        transform=EmotionDataAugmentation.get_val_transforms()
+    )
+    
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True
+    )
+    
+    # 创建模型
+    model = EmotionCNNWithAttention(
+        num_classes=6,
+        pretrained=True,
+        use_attention=True
+    ).to(device)
+    
+    # 使用多GPU
+    if torch.cuda.device_count() > 1:
+        print(f"使用 {torch.cuda.device_count()} 块GPU")
+        model = nn.DataParallel(model)
+    
+    # 定义损失函数和优化器
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', factor=0.5, patience=5, verbose=True
+    )
+    
+    # 训练历史记录
+    history = {
+        'train_loss': [], 'train_acc': [],
+        'val_loss': [], 'val_acc': []
+    }
+    
+    best_val_acc = 0
+    
+    # 训练循环
+    for epoch in range(epochs):
+        # 训练
+        train_loss, train_acc = train_epoch(
+            model, train_loader, criterion, optimizer, device
+        )
+        
+        # 验证
+        val_loss, val_acc, _, _ = validate(
+            model, val_loader, criterion, device
+        )
+        
+        # 学习率调度
+        scheduler.step(val_acc)
+        
+        # 记录历史
+        history['train_loss'].append(train_loss)
+        history['train_acc'].append(train_acc)
+        history['val_loss'].append(val_loss)
+        history['val_acc'].append(val_acc)
+        
+        print(f"Epoch {epoch+1}/{epochs}: "
+              f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%, "
+              f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
+        
+        # 保存最佳模型
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            torch.save(model.state_dict(), 'best_final_model.pth')
+            print(f"✓ 保存最佳模型，验证准确率: {val_acc:.2f}%")
+    
+    # 绘制训练曲线
+    plot_training_history(history)
+    
+    # 加载最佳模型进行测试
+    model.load_state_dict(torch.load('best_final_model.pth'))
+    
+    return model, test_loader, device, history
+
+# ============ 9. 绘制训练历史 ============
+def plot_training_history(history):
+    """绘制训练历史曲线"""
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    
+    epochs = range(1, len(history['train_loss']) + 1)
+    
+    # 绘制损失曲线
+    axes[0].plot(epochs, history['train_loss'], 'b-', label='Train Loss', linewidth=2)
+    axes[0].plot(epochs, history['val_loss'], 'r-', label='Validation Loss', linewidth=2)
+    axes[0].set_xlabel('Epoch', fontsize=12)
+    axes[0].set_ylabel('Loss', fontsize=12)
+    axes[0].set_title('Training and Validation Loss', fontsize=14)
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+    
+    # 绘制准确率曲线
+    axes[1].plot(epochs, history['train_acc'], 'b-', label='Train Accuracy', linewidth=2)
+    axes[1].plot(epochs, history['val_acc'], 'r-', label='Validation Accuracy', linewidth=2)
+    axes[1].set_xlabel('Epoch', fontsize=12)
+    axes[1].set_ylabel('Accuracy (%)', fontsize=12)
+    axes[1].set_title('Training and Validation Accuracy', fontsize=14)
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+
+# ============ 10. 生成预测结果（输出数字标签） ============
+def generate_predictions(model, test_loader, device, output_csv='submission.csv'):
+    """生成预测结果并保存为CSV（输出数字标签）"""
+    model.eval()
+    predictions = []
+    file_names = []
+    
+    with torch.no_grad():
+        for batch_idx, (images, paths) in enumerate(test_loader):
+            images = images.to(device)
+            outputs = model(images)
+            _, predicted = outputs.max(1)
+            
+            # 将预测结果添加到列表中（直接是数字0-5）
+            predictions.extend(predicted.cpu().numpy())
+            
+            # 处理文件路径
+            for path in paths:
+                file_name = Path(path).name
+                file_names.append(file_name)
+            
+            # 打印进度
+            if (batch_idx + 1) % 10 == 0:
+                print(f"处理进度: {batch_idx + 1}/{len(test_loader)} batches")
+    
+    # 创建结果DataFrame - Emotion列直接存储数字0-5
+    results_df = pd.DataFrame({
+        'ID': file_names,
+        'Emotion': predictions  # 直接输出数字0-5
+    })
+    
+    # 确保Emotion列是整数类型
+    results_df['Emotion'] = results_df['Emotion'].astype(int)
+    
+    # 按ID排序（如果需要）
+    results_df = results_df.sort_values('ID')
+    
+    # 保存为CSV
+    results_df.to_csv(output_csv, index=False)
+    print(f"\n✅ 预测结果已保存到: {output_csv}")
+    print(f"总预测样本数: {len(results_df)}")
+    
+    # 显示预测分布（使用数字标签）
+    print("\n📊 预测结果分布（数字标签）:")
+    emotion_counts = results_df['Emotion'].value_counts().sort_index()
+    
+    # 数字到情感的映射（仅用于显示）
+    emotion_mapping = {
+        0: "愤怒",
+        1: "恐惧", 
+        2: "快乐",
+        3: "悲伤",
+        4: "惊讶",
+        5: "中性"
+    }
+    
+    for emotion_num, count in emotion_counts.items():
+        emotion_name = emotion_mapping.get(emotion_num, f"未知({emotion_num})")
+        percentage = count/len(results_df)*100
+        print(f"  类别 {emotion_num} ({emotion_name}): {count} 张图片 ({percentage:.1f}%)")
+    
+    return results_df
+
+# ============ 11. 主函数 ============
+def main():
+    """主函数"""
+    # 设置路径 - 修改这一行！
+    ROOT_DIR = "/kaggle/input/neu-image-emotion-classification/fer_data/fer_data"
+    
+    print("🚀 开始人脸情感分类任务")
+    print("=" * 60)
+    
+    # 添加路径验证
+    import os
+    print(f"检查路径: {ROOT_DIR}")
+    print(f"路径是否存在: {os.path.exists(ROOT_DIR)}")
+    
+    if os.path.exists(ROOT_DIR):
+        print("目录内容:")
+        for item in os.listdir(ROOT_DIR):
+            print(f"  - {item}")
+    else:
+        print("⚠️ 警告：路径不存在！请检查路径设置。")
+        return
+    
+    # 1. 数据分析
+    analyze_dataset(ROOT_DIR)
+    
+    # 2. 交叉验证训练（可选）
+    print("\n🔧 开始交叉验证训练...")
+    try:
+        fold_results, mean_cv_acc = cross_validation_train(
+            ROOT_DIR,
+            num_folds=3,  # 可以设置为5，但为了速度这里设为3
+            epochs=15,
+            batch_size=128
+        )
+        print(f"交叉验证平均准确率: {mean_cv_acc:.2f}%")
+    except Exception as e:
+        print(f"交叉验证时出错: {e}")
+        print("继续使用完整训练...")
+    
+    # 3. 训练最终模型
+    print("\n🔥 训练最终模型...")
+    model, test_loader, device, history = train_final_model(
+        ROOT_DIR,
+        epochs=30,
+        batch_size=128
+    )
+    
+    # 4. 生成预测结果
+    print("\n📊 生成预测结果...")
+    results_df = generate_predictions(
+        model,
+        test_loader,
+        device,
+        output_csv='emotion_predictions.csv'
+    )
+    
+    # 5. 显示预测结果示例
+    print("\n📋 预测结果示例（前10行）:")
+    print(results_df.head(10))
+    
+    print("\n✅ 任务完成！")
+    print(f"预测结果保存在: emotion_predictions.csv")
+    print("\n⚠️ 注意：CSV文件中的Emotion列是数字标签，对应关系如下：")
+    print("  0: 愤怒, 1: 恐惧, 2: 快乐, 3: 悲伤, 4: 惊讶, 5: 中性")
+
+# ============ 12. 执行 ============
+if __name__ == '__main__':
+    main()
