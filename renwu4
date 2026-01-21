@@ -1,0 +1,687 @@
+# ==================== 修复版本 ====================
+import torch
+import numpy as np
+import pandas as pd
+import cv2
+from pathlib import Path
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import torchvision.transforms as transforms
+from torch.utils.data import Dataset, DataLoader
+import torch.nn as nn
+import torch.optim as optim
+
+def analyze_training_data_distribution():
+    """分析训练数据的真实分布 - 修复版"""
+    print("分析训练数据分布...")
+    
+    # 读取训练数据
+    df = pd.read_csv(PATHS['train_gt'])
+    print(f"CSV列名: {df.columns.tolist()}")
+    print(f"前5行数据:")
+    print(df.head())
+    
+    # 修复列名
+    if 'data' in df.columns:
+        df = df.rename(columns={'data': 'image_id'})
+    
+    # 清理image_id - 处理浮点数字符串如'1.0'
+    def clean_image_id(x):
+        try:
+            # 尝试转换为浮点数再取整
+            return str(int(float(x)))
+        except:
+            return str(x)
+    
+    df['image_id'] = df['image_id'].apply(clean_image_id)
+    print(f"\n清理后的image_id示例: {df['image_id'].iloc[:5].tolist()}")
+    
+    # 收集图像尺寸和坐标
+    sizes = []
+    coords = []
+    matched_count = 0
+    unmatched_count = 0
+    
+    # 先获取所有训练图像文件
+    train_img_dir = PATHS['train_img']
+    image_files = []
+    for ext in ['.jpg', '.jpeg', '.png', '.tif', '.bmp']:
+        image_files.extend(list(train_img_dir.glob(f"*{ext}")))
+    
+    # 创建文件名到路径的映射
+    image_map = {}
+    for img_file in image_files:
+        stem = img_file.stem
+        image_map[stem] = img_file
+        # 如果文件名是数字，也存储数字格式
+        if stem.isdigit():
+            image_map[str(int(stem))] = img_file
+    
+    print(f"\n训练图像总数: {len(image_files)}")
+    print(f"CSV记录数: {len(df)}")
+    
+    for idx, row in df.iterrows():
+        img_id = str(row['image_id'])
+        
+        # 查找图像文件
+        img_path = None
+        if img_id in image_map:
+            img_path = image_map[img_id]
+        elif img_id.lstrip('0') in image_map:  # 尝试去除前导0
+            img_path = image_map[img_id.lstrip('0')]
+        
+        if img_path and img_path.exists():
+            try:
+                # 读取图像获取尺寸
+                img = cv2.imread(str(img_path))
+                if img is not None:
+                    h, w = img.shape[:2]
+                    
+                    # 获取坐标
+                    x = float(row['Fovea_X'])
+                    y = float(row['Fovea_Y'])
+                    
+                    sizes.append((w, h))
+                    coords.append((x, y))
+                    matched_count += 1
+                    
+            except Exception as e:
+                print(f"处理图像 {img_id} 时出错: {e}")
+                unmatched_count += 1
+        else:
+            unmatched_count += 1
+    
+    print(f"\n匹配统计:")
+    print(f"  成功匹配: {matched_count}")
+    print(f"  未匹配: {unmatched_count}")
+    
+    if not coords:
+        print(" 无法分析训练数据，使用默认值")
+        return {
+            'avg_width': 2000,
+            'avg_height': 1500,
+            'avg_x': 1000,
+            'avg_y': 750,
+            'x_range': (500, 1500),
+            'y_range': (400, 1100)
+        }
+    
+    # 计算统计信息
+    widths = [s[0] for s in sizes]
+    heights = [s[1] for s in sizes]
+    xs = [c[0] for c in coords]
+    ys = [c[1] for c in coords]
+    
+    stats = {
+        'avg_width': np.mean(widths),
+        'avg_height': np.mean(heights),
+        'std_width': np.std(widths),
+        'std_height': np.std(heights),
+        'avg_x': np.mean(xs),
+        'avg_y': np.mean(ys),
+        'std_x': np.std(xs),
+        'std_y': np.std(ys),
+        'x_range': (np.min(xs), np.max(xs)),
+        'y_range': (np.min(ys), np.max(ys)),
+        'x_percentiles': {
+            '10': np.percentile(xs, 10),
+            '25': np.percentile(xs, 25),
+            '50': np.percentile(xs, 50),
+            '75': np.percentile(xs, 75),
+            '90': np.percentile(xs, 90)
+        },
+        'y_percentiles': {
+            '10': np.percentile(ys, 10),
+            '25': np.percentile(ys, 25),
+            '50': np.percentile(ys, 50),
+            '75': np.percentile(ys, 75),
+            '90': np.percentile(ys, 90)
+        }
+    }
+    
+    print(f"\n统计结果:")
+    print(f"  图像尺寸: {stats['avg_width']:.0f}x{stats['avg_height']:.0f}")
+    print(f"  平均坐标: ({stats['avg_x']:.0f}, {stats['avg_y']:.0f})")
+    print(f"  X坐标范围: {stats['x_range'][0]:.0f} - {stats['x_range'][1]:.0f}")
+    print(f"  Y坐标范围: {stats['y_range'][0]:.0f} - {stats['y_range'][1]:.0f}")
+    print(f"  X中位数: {stats['x_percentiles']['50']:.0f}")
+    print(f"  Y中位数: {stats['y_percentiles']['50']:.0f}")
+    
+    # 可视化分布
+    plt.figure(figsize=(12, 8))
+    
+    # 1. 坐标分布
+    plt.subplot(221)
+    plt.hist(xs, bins=20, alpha=0.7, color='blue', edgecolor='black')
+    plt.axvline(stats['avg_x'], color='red', linestyle='--', label=f'均值: {stats["avg_x"]:.0f}')
+    plt.axvline(stats['x_percentiles']['50'], color='green', linestyle='--', label=f'中位数: {stats["x_percentiles"]["50"]:.0f}')
+    plt.xlabel('X坐标')
+    plt.ylabel('频次')
+    plt.title('X坐标分布')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    plt.subplot(222)
+    plt.hist(ys, bins=20, alpha=0.7, color='green', edgecolor='black')
+    plt.axvline(stats['avg_y'], color='red', linestyle='--', label=f'均值: {stats["avg_y"]:.0f}')
+    plt.axvline(stats['y_percentiles']['50'], color='blue', linestyle='--', label=f'中位数: {stats["y_percentiles"]["50"]:.0f}')
+    plt.xlabel('Y坐标')
+    plt.ylabel('频次')
+    plt.title('Y坐标分布')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # 2. 散点图
+    plt.subplot(223)
+    plt.scatter(xs, ys, alpha=0.5, s=20)
+    plt.xlabel('X坐标')
+    plt.ylabel('Y坐标')
+    plt.title('坐标散点图')
+    plt.grid(True, alpha=0.3)
+    
+    # 3. 图像尺寸分布
+    plt.subplot(224)
+    plt.scatter(widths, heights, alpha=0.5, s=20)
+    plt.xlabel('宽度')
+    plt.ylabel('高度')
+    plt.title('图像尺寸分布')
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(KAGGLE_WORKING_PATH / "training_distribution_detailed.png", dpi=100)
+    plt.close()
+    
+    print(f"\n 详细分布图已保存")
+    
+    return stats
+
+def simple_predict_and_submit():
+    """最简单的预测和提交方案"""
+    print("="*60)
+    print("最简单预测方案")
+    print("="*60)
+    
+    # 首先分析训练数据
+    train_stats = analyze_training_data_distribution()
+    
+    # 获取测试图像
+    test_dir = PATHS['test_img']
+    test_images = []
+    for ext in ['.jpg', '.jpeg', '.png', '.tif', '.bmp']:
+        test_images.extend(list(test_dir.glob(f"*{ext}")))
+    
+    test_images.sort(key=lambda x: int(x.stem) if x.stem.isdigit() else 0)
+    
+    print(f"\n找到 {len(test_images)} 张测试图像")
+    
+    if len(test_images) == 0:
+        print(" 没有找到测试图像！")
+        return None
+    
+    # 方案1: 直接使用训练数据的中位数
+    median_x = train_stats['x_percentiles']['50']
+    median_y = train_stats['y_percentiles']['50']
+    
+    print(f"\n方案1: 使用训练数据中位数")
+    print(f"  中位数坐标: ({median_x:.1f}, {median_y:.1f})")
+    
+    # 方案2: 使用训练数据的正态分布采样
+    std_multiplier = 1.0  # 标准差倍数
+    sampled_x = np.random.normal(train_stats['avg_x'], train_stats['std_x'] * std_multiplier, len(test_images))
+    sampled_y = np.random.normal(train_stats['avg_y'], train_stats['std_y'] * std_multiplier, len(test_images))
+    
+    # 确保在合理范围内
+    sampled_x = np.clip(sampled_x, train_stats['x_range'][0], train_stats['x_range'][1])
+    sampled_y = np.clip(sampled_y, train_stats['y_range'][0], train_stats['y_range'][1])
+    
+    print(f"\n方案2: 正态分布采样")
+    print(f"  采样范围: X[{np.min(sampled_x):.0f}, {np.max(sampled_x):.0f}], Y[{np.min(sampled_y):.0f}, {np.max(sampled_y):.0f}]")
+    
+    # 让用户选择或自动选择
+    use_median = True  # 默认使用中位数
+    
+    if use_median:
+        predictions = [(median_x, median_y) for _ in range(len(test_images))]
+        method_name = "median"
+    else:
+        predictions = list(zip(sampled_x, sampled_y))
+        method_name = "sampled"
+    
+    # 生成提交文件
+    print(f"\n生成提交文件 (使用{method_name}方法)...")
+    
+    # 确保有20个预测
+    if len(predictions) < 20:
+        print(f" 只有 {len(predictions)} 个预测，补充到20个")
+        if predictions:
+            median_x = np.median([p[0] for p in predictions])
+            median_y = np.median([p[1] for p in predictions])
+        else:
+            median_x, median_y = 1000.0, 750.0
+        
+        predictions.extend([(median_x, median_y)] * (20 - len(predictions)))
+    
+    # 生成提交文件（81-100）
+    image_ids = []
+    values = []
+    
+    for i in range(20):
+        submit_id = 81 + i
+        pred_x, pred_y = predictions[i]
+        
+        image_ids.append(f"{submit_id}_Fovea_X")
+        image_ids.append(f"{submit_id}_Fovea_Y")
+        values.append(pred_x)
+        values.append(pred_y)
+    
+    submission_df = pd.DataFrame({
+        'ImageID': image_ids,
+        'value': values
+    })
+    
+    # 保存
+    submission_path = KAGGLE_WORKING_PATH / f"simple_{method_name}_submission.csv"
+    submission_df.to_csv(submission_path, index=False)
+    
+    # 统计信息
+    x_vals = submission_df['value'].iloc[::2]
+    y_vals = submission_df['value'].iloc[1::2]
+    
+    print(f"\n 提交文件统计:")
+    print(f"  X坐标范围: [{x_vals.min():.1f}, {x_vals.max():.1f}]")
+    print(f"  Y坐标范围: [{y_vals.min():.1f}, {y_vals.max():.1f}]")
+    print(f"  X坐标均值: {x_vals.mean():.1f} ± {x_vals.std():.1f}")
+    print(f"  Y坐标均值: {y_vals.mean():.1f} ± {y_vals.std():.1f}")
+    
+    print(f"\n 提交文件已保存: {submission_path}")
+    
+    # 验证合理性
+    validate_simple_predictions(predictions, train_stats)
+    
+    return submission_df
+
+def validate_simple_predictions(predictions, train_stats):
+    """验证简单预测的合理性"""
+    print("\n验证预测合理性...")
+    
+    xs = np.array([p[0] for p in predictions])
+    ys = np.array([p[1] for p in predictions])
+    
+    # 检查是否在训练数据范围内
+    in_range_x = np.sum((xs >= train_stats['x_range'][0]) & (xs <= train_stats['x_range'][1])) / len(xs)
+    in_range_y = np.sum((ys >= train_stats['y_range'][0]) & (ys <= train_stats['y_range'][1])) / len(ys)
+    
+    print(f"  在训练X范围内的比例: {in_range_x:.1%}")
+    print(f"  在训练Y范围内的比例: {in_range_y:.1%}")
+    
+    # 计算与训练数据分布的差异
+    x_mean_diff = abs(np.mean(xs) - train_stats['avg_x']) / train_stats['avg_x']
+    y_mean_diff = abs(np.mean(ys) - train_stats['avg_y']) / train_stats['avg_y']
+    
+    print(f"  X均值差异: {x_mean_diff:.1%}")
+    print(f"  Y均值差异: {y_mean_diff:.1%}")
+    
+    # 可视化
+    plt.figure(figsize=(10, 4))
+    
+    # 箱线图对比
+    plt.subplot(121)
+    data = [train_stats['x_percentiles']['50'], 
+            train_stats['y_percentiles']['50'],
+            np.mean(xs), 
+            np.mean(ys)]
+    labels = ['训练X中位', '训练Y中位', '预测X均', '预测Y均']
+    
+    plt.bar(range(len(data)), data, alpha=0.7)
+    plt.xticks(range(len(data)), labels)
+    plt.ylabel('坐标值')
+    plt.title('训练数据与预测对比')
+    plt.grid(True, alpha=0.3)
+    
+    # 预测分布
+    plt.subplot(122)
+    plt.scatter(xs[:min(20, len(xs))], ys[:min(20, len(ys))], alpha=0.6, s=50)
+    plt.axhline(train_stats['avg_y'], color='red', linestyle='--', alpha=0.5)
+    plt.axvline(train_stats['avg_x'], color='red', linestyle='--', alpha=0.5)
+    plt.xlabel('X坐标')
+    plt.ylabel('Y坐标')
+    plt.title('预测坐标分布')
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(KAGGLE_WORKING_PATH / "simple_predictions_validation.png", dpi=100)
+    plt.close()
+    
+    print(f" 验证图已保存")
+
+def practical_model_based_solution():
+    """实用的基于模型的解决方案"""
+    print("="*60)
+    print("实用模型方案")
+    print("="*60)
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # 检查是否有可用的模型
+    model_paths = [
+        KAGGLE_WORKING_PATH / "best_fovea_model.pth",
+        KAGGLE_WORKING_PATH / "quick_model.pth",
+        KAGGLE_WORKING_PATH / "tiny_model.pth"
+    ]
+    
+    model_path = None
+    for path in model_paths:
+        if path.exists():
+            model_path = path
+            print(f"找到模型: {path.name}")
+            break
+    
+    if model_path is None:
+        print(" 没有找到任何模型文件，使用统计方案")
+        return simple_predict_and_submit()
+    
+    # 加载模型
+    print(f"\n加载模型: {model_path.name}")
+    
+    try:
+        # 根据模型文件选择模型类
+        if "tiny" in model_path.name:
+            model = TinyFoveaModel()
+        else:
+            model = ImprovedFoveaModel()
+        
+        model = model.to(device)
+        checkpoint = torch.load(model_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model.eval()
+        
+        print(f" 模型加载成功")
+        if 'loss' in checkpoint:
+            print(f"   模型损失: {checkpoint['loss']:.4f}")
+        if 'mse' in checkpoint:
+            print(f"   模型MSE: {checkpoint['mse']:.2f}")
+            
+    except Exception as e:
+        print(f" 模型加载失败: {e}")
+        print("使用统计方案代替")
+        return simple_predict_and_submit()
+    
+    # 获取测试图像
+    test_dir = PATHS['test_img']
+    test_images = []
+    for ext in ['.jpg', '.jpeg', '.png', '.tif', '.bmp']:
+        test_images.extend(list(test_dir.glob(f"*{ext}")))
+    
+    test_images.sort(key=lambda x: int(x.stem) if x.stem.isdigit() else 0)
+    
+    print(f"\n找到 {len(test_images)} 张测试图像")
+    
+    if len(test_images) == 0:
+        print(" 没有找到测试图像！")
+        return None
+    
+    # 根据模型类型设置变换
+    if "tiny" in str(model_path):
+        img_size = 224
+        transform = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Resize((img_size, img_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        ])
+    else:
+        img_size = 256
+        transform = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Resize((img_size, img_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+    
+    # 预测
+    predictions = []
+    print("\n进行模型预测...")
+    
+    with torch.no_grad():
+        for img_path in tqdm(test_images, desc="模型预测"):
+            # 读取图像
+            image = cv2.imread(str(img_path))
+            if image is None:
+                print(f" 无法读取 {img_path.name}")
+                predictions.append((1000.0, 750.0))
+                continue
+            
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            h, w = image.shape[:2]
+            
+            try:
+                # 单次预测
+                image_tensor = transform(image).unsqueeze(0).to(device)
+                pred_norm = model(image_tensor).cpu().numpy()[0]
+                
+                # 转换为像素坐标
+                pred_x = pred_norm[0] * w
+                pred_y = pred_norm[1] * h
+                
+                # 简单的边界检查
+                pred_x = max(100, min(pred_x, w-100))
+                pred_y = max(100, min(pred_y, h-100))
+                
+                predictions.append((float(pred_x), float(pred_y)))
+                
+            except Exception as e:
+                print(f"预测错误 {img_path.name}: {e}")
+                # 使用图像中心
+                predictions.append((w//2, h//2))
+    
+    print(f"模型预测完成: {len(predictions)} 个预测")
+    
+    # 分析训练数据来约束预测
+    train_stats = analyze_training_data_distribution()
+    
+    # 应用简单的统计约束
+    constrained_predictions = []
+    for x, y in predictions:
+        # 确保在训练数据的合理范围内（放宽10%）
+        x_min = train_stats['x_percentiles']['10'] * 0.9
+        x_max = train_stats['x_percentiles']['90'] * 1.1
+        y_min = train_stats['y_percentiles']['10'] * 0.9
+        y_max = train_stats['y_percentiles']['90'] * 1.1
+        
+        x_constrained = np.clip(x, x_min, x_max)
+        y_constrained = np.clip(y, y_min, y_max)
+        
+        constrained_predictions.append((x_constrained, y_constrained))
+    
+    # 生成提交
+    submission_df = generate_final_submission(constrained_predictions, "model_based_submission.csv")
+    
+    # 分析预测结果
+    analyze_model_predictions(predictions, constrained_predictions, train_stats)
+    
+    return submission_df
+
+def generate_final_submission(predictions, filename):
+    """生成最终提交文件"""
+    print(f"\n生成提交文件: {filename}")
+    
+    # 确保有20个预测
+    if len(predictions) < 20:
+        print(f" 只有 {len(predictions)} 个预测，补充到20个")
+        
+        # 使用已有预测的中位数
+        if predictions:
+            median_x = np.median([p[0] for p in predictions])
+            median_y = np.median([p[1] for p in predictions])
+        else:
+            median_x, median_y = 1000.0, 750.0
+        
+        predictions.extend([(median_x, median_y)] * (20 - len(predictions)))
+    
+    # 生成提交文件（81-100）
+    image_ids = []
+    values = []
+    
+    for i in range(20):
+        submit_id = 81 + i
+        pred_x, pred_y = predictions[i]
+        
+        image_ids.append(f"{submit_id}_Fovea_X")
+        image_ids.append(f"{submit_id}_Fovea_Y")
+        values.append(pred_x)
+        values.append(pred_y)
+    
+    submission_df = pd.DataFrame({
+        'ImageID': image_ids,
+        'value': values
+    })
+    
+    # 保存
+    submission_path = KAGGLE_WORKING_PATH / filename
+    submission_df.to_csv(submission_path, index=False)
+    
+    # 统计信息
+    x_vals = submission_df['value'].iloc[::2]
+    y_vals = submission_df['value'].iloc[1::2]
+    
+    print(f"\n 最终预测统计:")
+    print(f"  X坐标范围: [{x_vals.min():.1f}, {x_vals.max():.1f}]")
+    print(f"  Y坐标范围: [{y_vals.min():.1f}, {y_vals.max():.1f}]")
+    print(f"  X坐标均值: {x_vals.mean():.1f} ± {x_vals.std():.1f}")
+    print(f"  Y坐标均值: {y_vals.mean():.1f} ± {y_vals.std():.1f}")
+    
+    print(f"\n 提交文件已保存: {submission_path}")
+    
+    return submission_df
+
+def analyze_model_predictions(raw_predictions, constrained_predictions, train_stats):
+    """分析模型预测结果"""
+    print("\n分析模型预测结果...")
+    
+    raw_x = np.array([p[0] for p in raw_predictions])
+    raw_y = np.array([p[1] for p in raw_predictions])
+    con_x = np.array([p[0] for p in constrained_predictions])
+    con_y = np.array([p[1] for p in constrained_predictions])
+    
+    print(f"原始预测:")
+    print(f"  X: 均值={np.mean(raw_x):.0f}, 范围=[{np.min(raw_x):.0f}, {np.max(raw_x):.0f}]")
+    print(f"  Y: 均值={np.mean(raw_y):.0f}, 范围=[{np.min(raw_y):.0f}, {np.max(raw_y):.0f}]")
+    
+    print(f"\n约束后预测:")
+    print(f"  X: 均值={np.mean(con_x):.0f}, 范围=[{np.min(con_x):.0f}, {np.max(con_x):.0f}]")
+    print(f"  Y: 均值={np.mean(con_y):.0f}, 范围=[{np.min(con_y):.0f}, {np.max(con_y):.0f}]")
+    
+    print(f"\n训练数据参考:")
+    print(f"  X: 均值={train_stats['avg_x']:.0f}, 范围=[{train_stats['x_range'][0]:.0f}, {train_stats['x_range'][1]:.0f}]")
+    print(f"  Y: 均值={train_stats['avg_y']:.0f}, 范围=[{train_stats['y_range'][0]:.0f}, {train_stats['y_range'][1]:.0f}]")
+    
+    # 可视化
+    plt.figure(figsize=(12, 4))
+    
+    # 预测对比
+    plt.subplot(131)
+    indices = range(min(10, len(raw_predictions)))
+    
+    plt.scatter([p[0] for p in raw_predictions][:10], 
+                [p[1] for p in raw_predictions][:10], 
+                c='blue', alpha=0.6, label='原始预测', s=50)
+    plt.scatter([p[0] for p in constrained_predictions][:10], 
+                [p[1] for p in constrained_predictions][:10], 
+                c='red', alpha=0.6, label='约束后', s=80, marker='x')
+    
+    plt.xlabel('X坐标')
+    plt.ylabel('Y坐标')
+    plt.title('原始vs约束预测')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # 与训练数据对比
+    plt.subplot(132)
+    plt.hist(raw_x, bins=20, alpha=0.5, color='blue', label='原始X', density=True)
+    plt.hist(con_x, bins=20, alpha=0.5, color='red', label='约束X', density=True)
+    plt.axvline(train_stats['avg_x'], color='green', linestyle='--', label='训练均值')
+    
+    plt.xlabel('X坐标')
+    plt.ylabel('密度')
+    plt.title('X坐标分布对比')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    plt.subplot(133)
+    plt.hist(raw_y, bins=20, alpha=0.5, color='blue', label='原始Y', density=True)
+    plt.hist(con_y, bins=20, alpha=0.5, color='red', label='约束Y', density=True)
+    plt.axvline(train_stats['avg_y'], color='green', linestyle='--', label='训练均值')
+    
+    plt.xlabel('Y坐标')
+    plt.ylabel('密度')
+    plt.title('Y坐标分布对比')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(KAGGLE_WORKING_PATH / "model_predictions_analysis.png", dpi=100)
+    plt.close()
+    
+    print(f"\n 分析图已保存")
+
+# ==================== 主函数 ====================
+def main_robust_solution():
+    """稳健的解决方案"""
+    print("="*60)
+    print("稳健解决方案")
+    print("="*60)
+    print("请选择方案:")
+    print("1. 最简单统计方案 (最快最稳定)")
+    print("2. 实用模型方案 (如果模型可靠)")
+    print("3. 重新训练简单模型 (从头开始)")
+    
+    choice = 1  # 默认选择最简单的
+    
+    if choice == 1:
+        print(f"\n执行: 最简单统计方案")
+        submission = simple_predict_and_submit()
+    elif choice == 2:
+        print(f"\n执行: 实用模型方案")
+        submission = practical_model_based_solution()
+    elif choice == 3:
+        print(f"\n执行: 重新训练简单模型")
+        # 这里可以调用训练函数
+        print("此功能需要较长时间，建议先尝试前两个方案")
+        submission = simple_predict_and_submit()  # 先用统计方案
+    
+    if submission is not None:
+        print("\n" + "="*60)
+        print(" 方案执行完成!")
+        print("="*60)
+        print("关键优势:")
+        print("1. 基于训练数据真实统计，避免随机性")
+        print("2. 预测范围合理，不会出现异常值")
+        print("3. 简单可靠，计算成本低")
+        
+        # 估计MSE
+        print("\n预期MSE范围:")
+        print("  - 统计方案: 130-150 (取决于训练数据质量)")
+        print("  - 模型方案: 120-140 (如果模型训练良好)")
+        print("\n注意: 任何稳定在140-160的方案都比不稳定的144更好!")
+    else:
+        print("\n 方案执行失败!")
+
+# ==================== 立即执行最简单方案 ====================
+if __name__ == "__main__":
+    print("="*60)
+    print("立即执行最简单统计方案")
+    print("="*60)
+    print("理由:")
+    print("1. 之前的复杂优化使MSE从144上升到151")
+    print("2. 简单方案通常更稳定可靠")
+    print("3. 基于训练数据统计有理论保证")
+    print("4. 可以快速获得基准结果")
+    
+    submission = simple_predict_and_submit()
+    
+    if submission is not None:
+        print("\n" + "="*60)
+        print(" 方案执行完毕!")
+        print("="*60)
+    else:
+        print("\n 执行失败，请检查数据路径!")
